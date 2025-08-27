@@ -1,34 +1,57 @@
-import {
-  Agent,
-  AgentModenaUniversalRegistry,
-  AgentModenaUniversalResolver,
-  DWNTransport,
-  WACIProtocol,
-  WebsocketServerTransport,
-} from '@extrimian/agent';
 import { FactoryProvider } from '@nestjs/common';
 import { CONFIG, Configuration } from '../config';
-import { FileSystemStorage } from '../storage/filesystem-storage';
-import { VaultStorage } from 'src/storage/vault-storage';
+import {
+  Agent,
+  AgentSecureStorage,
+  AgentModenaUniversalRegistry,
+  AgentModenaUniversalResolver,
+  WACIProtocol,
+  WebsocketServerTransport,
+  WebsocketClientTransport,
+  IAgentStorage,
+} from '@extrimian/agent';
+import { INJECTION_TOKENS } from '../constants/injection-tokens';
+import { Logger } from '../utils/logger';
+import { OutgoingWebhookService } from './outgoing-webhook.service';
+import { VerifiablePresentationFinishedEventData } from '../webhooks/dtos/outgoing-webhook.dto';
+import { CredentialPresentationMongoStorage } from '../storage/waci-presentation-mongo.storage';
 
 export const AgentProvider: FactoryProvider<Agent> = {
   provide: Agent,
-  inject: [VaultStorage, WACIProtocol, WebsocketServerTransport, CONFIG],
+  inject: [
+    INJECTION_TOKENS.AGENT_SECURE_STORAGE,
+    INJECTION_TOKENS.AGENT_STORAGE,
+    INJECTION_TOKENS.VC_STORAGE,
+    CONFIG,
+    WebsocketServerTransport,
+    WACIProtocol,
+    OutgoingWebhookService,
+    CredentialPresentationMongoStorage,
+  ],
   useFactory: async (
-    vaultStorage: VaultStorage,
-    waciProtocol: WACIProtocol,
-    transport: WebsocketServerTransport,
+    secureStorage: AgentSecureStorage,
+    agentStorage: IAgentStorage,
+    vcStorage: IAgentStorage,
     config: Configuration,
+    transport: WebsocketServerTransport,
+    waciProtocol: WACIProtocol,
+    outgoingWebhookService: OutgoingWebhookService,
+    waciPresentationDataService: CredentialPresentationMongoStorage,
   ) => {
     const agent = new Agent({
-      didDocumentRegistry: new AgentModenaUniversalRegistry(config.MODENA_URL),
+      didDocumentRegistry: new AgentModenaUniversalRegistry(
+        config.MODENA_URL,
+        config.DID_METHOD,
+      ),
       didDocumentResolver: new AgentModenaUniversalResolver(config.MODENA_URL),
+      supportedTransports: [new WebsocketClientTransport()],
       vcProtocols: [waciProtocol],
-      supportedTransports: [new DWNTransport()],
-      agentStorage: new FileSystemStorage({ filepath: './storage/agent-storage.json' }),
-      vcStorage: new FileSystemStorage({ filepath: './vc-storage.json' }),
-      secureStorage: vaultStorage,
+      agentPlugins: [],
+      agentStorage,
+      vcStorage,
+      secureStorage,
     });
+
     await agent.initialize();
     const dids = agent.identity.getDIDs();
     if (!dids.length) {
@@ -48,10 +71,77 @@ export const AgentProvider: FactoryProvider<Agent> = {
     }
 
     agent.vc.ackCompleted.on((param) => {
-      console.log('ack completed', param);
+      Logger.debug('Acknowledgment completed', { param });
+    });
+
+    agent.vc.presentationVerified.on(async (param) => {
+      Logger.debug('🔍 Type checking presentationVerified param', {
+        paramKeys: Object.keys(param),
+        hasInvitationId: 'invitationId' in param,
+        paramInvitationId: (param as any).invitationId,
+        thid: param.thid,
+        verified: param.verified,
+        vcsCount: param.vcs?.length,
+        messageId: param.messageId,
+        fullParam: JSON.stringify(param, null, 2),
+      });
+
+      const originalInvitationId = (param as any)?.invitationId;
+
+      if (!originalInvitationId) {
+        return;
+      }
+
+      const firstVc = param.vcs?.[0] as any;
+      const holderDID =
+        firstVc?.holder ||
+        firstVc?.credentialSubject?.id ||
+        firstVc?.data?.holder ||
+        'unknown';
+
+      const finalInvitationId = originalInvitationId || param.thid;
+      const presentationData = await waciPresentationDataService.getData(
+        finalInvitationId,
+      );
+
+      const presentationEventData: VerifiablePresentationFinishedEventData = {
+        invitationId: finalInvitationId,
+        verified: param.verified,
+        verifiableCredentials:
+          param.vcs?.map((vc) => ({
+            id: vc.id,
+            credentialSubject: vc?.credentialSubject,
+          })) || [],
+        holderDID,
+        thid: param.thid,
+        messageId: param.messageId,
+        webhookUrl:
+          presentationData && presentationData.length > 0
+            ? (presentationData[presentationData.length - 1] as any)?.webhookUrl
+            : undefined,
+      };
+
+      Logger.log('✅ Presentation verified - sending webhook', {
+        thid: param.thid,
+        originalInvitationId,
+        webhookPayload: presentationEventData,
+      });
+
+      try {
+        await outgoingWebhookService.sendVerifiablePresentationFinishedWebhook(
+          presentationEventData,
+        );
+
+        Logger.log('✅ Webhook sent successfully');
+      } catch (error) {
+        Logger.error('❌ Error sending presentation verified webhook', error);
+      }
     });
 
     agent.vc.credentialArrived.on(async (vcs) => {
+      Logger.debug('Processing arrived credentials', {
+        count: vcs.credentials.length,
+      });
       await Promise.all(
         vcs.credentials.map((vc) => {
           agent.vc.saveCredentialWithInfo(vc.data, {
@@ -60,7 +150,34 @@ export const AgentProvider: FactoryProvider<Agent> = {
           });
         }),
       );
+      try {
+        await outgoingWebhookService.sendCredentialIssuedWebhook(
+          vcs.credentials[0].data,
+          vcs.credentials[0].data.holder,
+        );
+      } catch (error) {
+        Logger.error('Error sending credential arrived webhook', error);
+      }
     });
+
+    agent.vc.credentialPresented.on((data) => {
+      Logger.debug('Credential presented', {
+        vcVerified: data.vcVerified,
+        presentationVerified: data.presentationVerified,
+        vcId: data.vc.id,
+        fullData: data,
+      });
+    });
+
+    agent.vc.problemReport.on((data) => {
+      Logger.error('Problem report received', {
+        did: data.did.value,
+        code: data.code,
+        invitationId: data.invitationId,
+        messageId: data.messageId,
+      });
+    });
+
     return agent;
   },
 };

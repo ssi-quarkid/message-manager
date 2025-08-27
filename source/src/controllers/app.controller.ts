@@ -1,35 +1,44 @@
-import { Agent, CredentialFlow, DID } from '@extrimian/agent';
-import { GoalCode } from '@extrimian/waci';
+import { Agent, CredentialFlow, DID, InputDescriptor } from '@extrimian/agent';
 import {
   BadRequestException,
   Body,
   Controller,
   Get,
-  Inject,
   Post,
   UseGuards,
 } from '@nestjs/common';
-import { decode } from 'base-64';
-import { CONFIG, Configuration } from '../config';
+import { ApiTokenAuthGuard } from '../auth/guard/apitoken-auth.guard';
+import { Logger } from '../utils/logger';
 import { VerifiableCredentialWithInfo } from '@extrimian/agent/dist/vc/protocols/waci-protocol';
-import { ApiTokenAuthGuard } from 'src/auth/guard/apitoken-auth.guard';
+import { StoredCredentialData } from '../storage/waci-issue-credential-data-mongo.storage';
+import { InvitationProcessingService } from '../services/invitation-processing.service';
 
 enum OobGoalCode {
   LOGIN = 'extrimian/did-authentication/signin',
   SIGNUP = 'extrimian/did-authentication/signup',
 }
 
-@UseGuards(ApiTokenAuthGuard)
+enum GoalCode {
+  Issuance = 'streamlined-vc',
+  Presentation = 'streamlined-vp',
+}
+
 @Controller()
 export class AppController {
   constructor(
     private agent: Agent,
-    @Inject(CONFIG) private config: Configuration,
+    private invitationProcessingService: InvitationProcessingService,
   ) {}
 
-  // Refactor
   @Post('message')
-  async createInvitation(@Body('goalCode') goalCode: GoalCode | OobGoalCode) {
+  @UseGuards(ApiTokenAuthGuard)
+  async createInvitation(
+    @Body('goalCode') goalCode: GoalCode | OobGoalCode,
+    @Body('credentialData') credentialData?: StoredCredentialData,
+    @Body('presentationData') presentationData?: InputDescriptor[],
+  ) {
+    Logger.log('🚀 API: Received invitation creation request', { goalCode });
+
     let flow: CredentialFlow;
     switch (goalCode) {
       case GoalCode.Issuance:
@@ -40,21 +49,40 @@ export class AppController {
         break;
 
       default:
+        Logger.error('❌ Unsupported goal code', null, { goalCode });
         throw new BadRequestException('Unsupported goal code');
     }
-    const invitation = await this.agent.vc.createInvitationMessage({ flow });
-    const invitationSplit = invitation.split('?_oob=')[1];
-    const invitationDecoded = JSON.parse(decode(invitationSplit));
-    return invitationDecoded;
+
+    const processedInvitation =
+      await this.invitationProcessingService.createAndProcessInvitation(
+        flow,
+        credentialData,
+        presentationData,
+      );
+
+    Logger.log('🎉 API: Invitation created successfully', {
+      invitationId: processedInvitation.invitationId,
+      goalCode,
+      presentationData,
+    });
+
+    return processedInvitation;
   }
 
   @Get('issued-vcs')
+  @UseGuards(ApiTokenAuthGuard)
   async getIssuedVcs(): Promise<VerifiableCredentialWithInfo[]> {
     return this.agent.vc.getVerifiableCredentialsWithInfo();
   }
 
   @Post('send-invitation')
+  @UseGuards(ApiTokenAuthGuard)
   sendInvitation(@Body() body: any): void {
+    Logger.debug('Sending invitation message', {
+      to: body.to,
+      messageLength: body.message?.length,
+    });
+
     this.agent.messaging.sendMessage({
       to: DID.from(body.to),
       message: body.message,

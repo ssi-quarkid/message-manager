@@ -8,8 +8,6 @@ const config = {
     process.env.WEBSOCKET_ENDPOINT_ID || 'MessagingWebSocket',
   DID_METHOD: process.env.DID_METHOD,
   WEBSOCKET_ENDPOINT_URL: process.env.WEBSOCKET_ENDPOINT_URL,
-  SSI_INTEGRATION_API_URL: process.env.SSI_INTEGRATION_API_URL,
-  SSI_INTEGRATION_TOKEN: process.env.SSI_INTEGRATION_TOKEN,
   MONGO_URI: process.env.MONGO_URI,
   MODENA_URL: process.env.MODENA_URL,
   VAULT_URL: process.env.VAULT_URL,
@@ -17,10 +15,19 @@ const config = {
   VAULT_SECRET_ID: process.env.VAULT_SECRET_ID,
   DWN_URL: process.env.DWN_URL,
   TOKEN_SECRET: process.env.TOKEN_SECRET,
+  TEST_WEBHOOK_URL: process.env.TEST_WEBHOOK_URL,
+  PROD_WEBHOOK_URL: process.env.PROD_WEBHOOK_URL,
+  NODE_ENV: process.env.NODE_ENV,
+  APP_URL:
+    process.env.NODE_ENV === 'production'
+      ? 'https://message-manager-production.up.railway.app'
+      : 'https://a44cd90c2531.ngrok-free.app',
 };
 
 export const CONFIG = Symbol.for('CONFIG');
+
 export type Configuration = typeof config;
+
 export const ConfigProvider: ValueProvider<Configuration> = {
   provide: CONFIG,
   useValue: config,

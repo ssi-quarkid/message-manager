@@ -4,8 +4,8 @@ import {
   OnGatewayInit,
   WebSocketGateway,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
 import { Agent, WebsocketServerTransport } from '@extrimian/agent';
+import { Logger } from '../utils/logger';
 
 @WebSocketGateway({ cors: true })
 export class MessagingGateway
@@ -22,10 +22,30 @@ export class MessagingGateway
   }
 
   handleConnection(client: any): void {
-    Logger.log(`Client connected: ${client.id}`);
+    Logger.debug('Client connected', {
+      clientId: client.id,
+      gateway: this.constructor.name,
+    });
+
+    client.onAny((event, ...args) => {
+      // Log specific credential-related events
+      if (
+        event.includes('credential') ||
+        event.includes('invitation') ||
+        event.includes('waci')
+      ) {
+        Logger.log('🔔 Credential-related socket event', {
+          event,
+          clientId: client.id,
+        });
+      }
+    });
   }
 
   handleDisconnect(client: any): void {
-    Logger.log(`Client disconnected: ${client.id}`);
+    Logger.debug('Client disconnected', {
+      clientId: client.id,
+      gateway: this.constructor.name,
+    });
   }
 }
